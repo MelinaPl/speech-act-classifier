@@ -2,43 +2,21 @@ import pandas as pd
 import json
 from transformers import AutoModelForSequenceClassification, TrainingArguments, Trainer
 from transformers import AutoTokenizer, DataCollatorWithPadding
-import numpy as np
-import evaluate
 from datasets import Dataset
 from sklearn.model_selection import train_test_split
 import torch
 import os
 import wandb
+from transformers import set_seed
+from sklearn.metrics import classification_report
 
-### Check device
+#### Check device and set seed
+
+set_seed(123)
 print(torch.has_mps)
 device = torch.device('mps')
-### Log in to wandb
 
-### Class for metrics
-class ConfiguredMetric:
-    def __init__(self, metric, *metric_args, **metric_kwargs):
-        self.metric = metric
-        self.metric_args = metric_args
-        self.metric_kwargs = metric_kwargs
-    
-    def add(self, *args, **kwargs):
-        return self.metric.add(*args, **kwargs)
-    
-    def add_batch(self, *args, **kwargs):
-        return self.metric.add_batch(*args, **kwargs)
-
-    def compute(self, *args, **kwargs):
-        return self.metric.compute(*args, *self.metric_args, **kwargs, **self.metric_kwargs)
-
-    @property
-    def name(self):
-        return self.metric.name
-
-    def _feature_names(self):
-        return self.metric._feature_names()
-    
-#### LOAD MY DATA
+#### Load my data
 
 with open("/Users/melinaplakidis/Documents/Sprachtechnologie_HA/data/annotations_with_text.json", "r", encoding="utf8") as f:
     data = json.load(f)
@@ -56,22 +34,31 @@ def sentence_iterator(data):
                 fine = sentences[sentence]['fine']
                 yield text, coarse, fine
 
+labels_to_exclude = ["DISAGREE", "APOLOGIZE", "THANK", "GREET"] # occur < 10 times in the entire dataset
+
 texts, coarses, fines = [], [], []
 for text, coarse, fine in sentence_iterator(data):
     texts.append(text)
     coarses.append(coarse)
-    fines.append(fine)
-  
-df = pd.DataFrame({"text": texts, "labels": coarses})#, "fines": fines})
+    if fine in labels_to_exclude:
+        fines.append("EXCLUDED")
+    elif coarse == "COMMISSIVE":
+        fines.append("COMMISSIVE") # no fine-grained categories for commissives
+    else:
+        fines.append(fine)
+
+df = pd.DataFrame({"text": texts, "labels": fines})
 print(df)
 
-#### CONVERT TO HF DATASET
+#### Convert to Huggingface dataset
 
-unsplitted_dataset = Dataset.from_pandas(df)
-dataset = unsplitted_dataset.train_test_split(test_size=0.2, seed=200)
-print(dataset)
+train_df, test_df = train_test_split(df, test_size=0.2, random_state=200)
 
-### START PREPROCESSING 
+train_dataset = Dataset.from_pandas(train_df)
+test_dataset = Dataset.from_pandas(test_df)
+print(test_dataset)
+
+#### Get labels
 
 labels = [i for i in df['labels'].values.tolist()]
 unique_labels = set()
@@ -79,19 +66,15 @@ unique_labels = set()
 for lb in labels:
     if lb not in unique_labels:
         unique_labels.add(lb)
-labels_to_ids = {k: v for v, k in enumerate(unique_labels)}
-ids_to_labels = {v: k for v, k in enumerate(unique_labels)}
+labels_to_ids = {k: v for v, k in enumerate(sorted(unique_labels))}
+ids_to_labels = {v: k for v, k in enumerate(sorted(unique_labels))}
 
-print(unique_labels)
-print(labels_to_ids)
-print(ids_to_labels)
-tokenizer = AutoTokenizer.from_pretrained("bert-base-german-cased")
-tokenizer.to(device)
+#### Load tokenizer and model
 
+tokenizer = AutoTokenizer.from_pretrained("dbmdz/bert-base-german-cased")
 model = AutoModelForSequenceClassification.from_pretrained(
-    "bert-base-german-cased", num_labels=6, id2label=ids_to_labels, label2id=labels_to_ids
-)
-model.to(device)
+    "dbmdz/bert-base-german-cased", num_labels=len(unique_labels), id2label=ids_to_labels, label2id=labels_to_ids
+).to(device)
 
 
 def preprocess_function(examples):
@@ -100,48 +83,41 @@ def preprocess_function(examples):
     examples["labels"] = int_labels
     return tokenizer(text, padding=True, truncation=True, return_tensors="pt")
 
-tokenized_data_train = dataset["train"].map(preprocess_function, batched=True, remove_columns="text")
-tokenized_data_test = dataset["test"].map(preprocess_function, batched=True, remove_columns="text")
-#print(tokenized_data_test)
+tokenized_data_train = train_dataset.map(preprocess_function, batched=True, remove_columns="text")
+tokenized_data_test = test_dataset.map(preprocess_function, batched=True, remove_columns="text")
 
 data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-classification_report_metric = evaluate.load("bstrai/classification_report")
-# clf_metrics = evaluate.combine([
-#     evaluate.load('accuracy'), 
-#     ConfiguredMetric(evaluate.load('f1'), average='macro'),
-#     ConfiguredMetric(evaluate.load('precision'), average='macro'),
-#     ConfiguredMetric(evaluate.load('recall'), average='macro')
-# ])
+def compute_metrics(eval_preds):
+    labels = eval_preds.label_ids
+    preds = eval_preds.predictions.argmax(-1)
+    report = classification_report(labels, preds, target_names=sorted(unique_labels), zero_division=0, output_dict=True)
+    df_report = pd.DataFrame(report).transpose()
+    print(df_report.to_latex())
+    return report
 
-def compute_metrics(eval_pred):
-    predictions, labels = eval_pred
-    predictions = np.argmax(predictions, axis=1)
-    predictions_str = [ids_to_labels[idx] for idx in predictions]
-    labels_str = [ids_to_labels[idx] for idx in labels]
-    print(f"Predictions: {predictions_str}, Labels: {labels_str}")
-    return classification_report_metric.compute(predictions=predictions, references=labels)#, average='micro')
+#### Set WANDB 
 
-# set the wandb project where this run will be logged
 os.environ["WANDB_PROJECT"]="speech-acts"
-
-# save your trained model checkpoint to wandb
 os.environ["WANDB_LOG_MODEL"]="true"
-
-# turn off watch to log faster
 os.environ["WANDB_WATCH"]="false"
 
 training_args = TrainingArguments(
-    output_dir="model_with_metrics_coarse",
+    output_dir="fine_cased",
     learning_rate=2e-5,
     per_device_train_batch_size=16,
     per_device_eval_batch_size=16,
-    num_train_epochs=2,
+    num_train_epochs=6,
     weight_decay=0.01,
     evaluation_strategy="epoch",
     save_strategy="epoch",
     load_best_model_at_end=True,
+    metric_for_best_model="accuracy",
     report_to='wandb',
+    use_mps_device=True,
+    seed=123, 
+    data_seed=123,
+    full_determinism=True
 )
 
 trainer = Trainer(
@@ -154,8 +130,11 @@ trainer = Trainer(
     compute_metrics=compute_metrics,
 )
 
+#### Start training and evaluate
+
 trainer.train()
 print(trainer.evaluate())
+wandb.finish()
 
 ### Uncomment the following to test trained model on one sentence
 
