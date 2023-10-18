@@ -1,73 +1,76 @@
 import pandas as pd
 import json
-from transformers import AutoModelForSequenceClassification, TrainingArguments, Trainer, AutoTokenizer, DataCollatorWithPadding
+from transformers import AutoModelForSequenceClassification, TrainingArguments, Trainer
+from transformers import AutoTokenizer, DataCollatorWithPadding
 from datasets import Dataset
-from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, precision_recall_fscore_support, f1_score
 import torch
 import os
-import wandb
+import numpy as np
 from transformers import set_seed
+import wandb
+import platform
 
-#### Check device and set seed
-
+#### Ensure reproducibility
+os.environ['PYTHONHASHSEED']= "123"
 set_seed(123)
-print(torch.has_mps)
-device = torch.device('mps')
 
-#### Load my data
+#### check whether x86 or arm64 is used, should be the latter
+print(platform.platform()) 
 
-with open("/Users/melinaplakidis/Documents/Sprachtechnologie_HA/data/annotations_with_text.json", "r", encoding="utf8") as f:
-    data = json.load(f)
+"""
+If its x86, type the following into the console:
 
-def sentence_iterator(data):
-    for ele in data:
-        name = ele
-        tweet = data[ele]
-        for value in tweet.values():
-            sentences = value['sentences']
-            for sentence in sentences:
-                text = sentences[sentence]['text']
-                stype = sentences[sentence]['stype']
-                if sentences[sentence]['coarse'] == "COMMISSIVE" or sentences[sentence]['coarse'] == "OTHER":
-                    coarse = "COMOTH"
-                else:
-                    coarse = sentences[sentence]['coarse']
-                fine = sentences[sentence]['fine']
-                yield text, coarse, fine
+$ CONDA_SUBDIR=osx-arm64 conda create -n env_name -c conda-forge
+$ conda activate env_name
+$ conda config --env --set subdir osx-arm64
+$ conda install python=3.9
+$ pip install -r requirements.txt
 
-texts, coarses, fines = [], [], []
-for text, coarse, fine in sentence_iterator(data):
-    texts.append(text)
-    coarses.append(coarse)
-    fines.append(fine)
-  
-df = pd.DataFrame({"text": texts, "labels": coarses})
+"""
+### Start a new wandb run to track this script
+wandb.init(
+    project="speech-acts"
+)
 
-#### Convert to Huggingface dataset
+#### This ensures that the current MacOS version is at least 12.3+
+print(torch.backends.mps.is_available())
+#### This ensures that the current PyTorch installation was built with MPS activated.
+print(torch.backends.mps.is_built())
 
-train_df, test_df = train_test_split(df, test_size=0.2, random_state=200)
-train_dataset = Dataset.from_pandas(train_df)
-test_dataset = Dataset.from_pandas(test_df)
+#### Set device (only for Mac!)
+device = torch.device("mps")
 
-#### Get labels
+#### Set paths 
 
-labels = [i for i in df['labels'].values.tolist()]
-unique_labels = set()
+WORKING_DIR = os.path.dirname(__file__)
+DATA_DIR = "data"
+MODEL_DIR = os.path.join(WORKING_DIR, "models")
+full_path = os.path.join(WORKING_DIR, DATA_DIR)
+print(full_path)
 
-for lb in labels:
-    if lb not in unique_labels:
-        unique_labels.add(lb)
-labels_to_ids = {k: v for v, k in enumerate(sorted(unique_labels))}
-ids_to_labels = {v: k for v, k in enumerate(sorted(unique_labels))}
+#### Load my dataset
 
-#### Load tokenizer and model
+train = pd.read_csv(os.path.join(full_path,"train_coarse_merged.csv"),sep='\t')
+test = pd.read_csv(os.path.join(full_path,"test_coarse_merged.csv"), sep="\t")
+
+#### Get label mappings
+
+labels_to_ids = {'ASSERTIVE': 0, 'COMOTH': 1, 'DIRECTIVE': 2, 'EXPRESSIVE': 3, 'UNSURE': 4}
+ids_to_labels = {0: 'ASSERTIVE', 1: 'COMOTH', 2: 'DIRECTIVE', 3: 'EXPRESSIVE', 4: 'UNSURE'}
+unique_labels = {'COMOTH', 'EXPRESSIVE', 'ASSERTIVE', 'DIRECTIVE', 'UNSURE'}
+
+
+#### Load tokenizer
 
 tokenizer = AutoTokenizer.from_pretrained("dbmdz/bert-base-german-cased")
-model = AutoModelForSequenceClassification.from_pretrained(
-    "dbmdz/bert-base-german-cased", num_labels=5, id2label=ids_to_labels, label2id=labels_to_ids
-).to(device)
 
+#### Transform to HF datasets
+
+train_dataset = Dataset.from_pandas(train)
+test_dataset = Dataset.from_pandas(test)
+print(train_dataset[0])
 
 def preprocess_function(examples):
     text = examples["text"]
@@ -80,14 +83,17 @@ tokenized_data_test = test_dataset.map(preprocess_function, batched=True, remove
 
 data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
+
 def compute_metrics(eval_preds):
     labels = eval_preds.label_ids
     preds = eval_preds.predictions.argmax(-1)
     report = classification_report(labels, preds, target_names=sorted(unique_labels), zero_division=0, output_dict=True)
     df_report = pd.DataFrame(report).transpose()
     print(df_report.to_latex())
-    return report
-
+    macro_f1 = report["macro avg"]["f1-score"]
+    weight_f1 = report["weighted avg"]["f1-score"]
+    score_dict = {"macro_f1": macro_f1, "weighted_f1": weight_f1}
+    return score_dict
 
 #### Set WANDB 
 
@@ -95,46 +101,58 @@ os.environ["WANDB_PROJECT"]="speech-acts"
 os.environ["WANDB_LOG_MODEL"]="true"
 os.environ["WANDB_WATCH"]="false"
 
+def model_init():
+    return AutoModelForSequenceClassification.from_pretrained("dbmdz/bert-base-german-cased",
+    num_labels = 5, # The number of output labels
+    id2label=ids_to_labels,
+    label2id=labels_to_ids).to(device)
+
 training_args = TrainingArguments(
-    output_dir="coarse_cased_5classes",
-    learning_rate=2e-5,
+    output_dir="model_name",
     per_device_train_batch_size=16,
     per_device_eval_batch_size=16,
-    num_train_epochs=6,
+    learning_rate=2e-5,
+    optim="adamw_torch",
+    save_total_limit=1,
+    num_train_epochs=10,
+    warmup_ratio=0.1,
     weight_decay=0.01,
     evaluation_strategy="epoch",
     save_strategy="epoch",
     load_best_model_at_end=True,
-    metric_for_best_model="accuracy",
-    report_to='wandb',
-    use_mps_device=True,
-    seed=123, 
+    metric_for_best_model="macro_f1",
     data_seed=123,
-    full_determinism=True
+    seed=123,
+    full_determinism=True,
+    use_mps_device=True
 )
 
 trainer = Trainer(
-    model=model,
+    model=model_init(),
     args=training_args,
     train_dataset=tokenized_data_train,
     eval_dataset=tokenized_data_test,
     tokenizer=tokenizer,
     data_collator=data_collator,
-    compute_metrics=compute_metrics,
+    compute_metrics=compute_metrics
 )
 
 #### Start training and evaluate
 
 trainer.train()
 print(trainer.evaluate())
+
+#### After training, access the path of the best checkpoint like this
+best_ckpt_path = trainer.state.best_model_checkpoint
+print(best_ckpt_path)
 wandb.finish()
 
-### Uncomment the following to test trained model on one sentence
+# ### Uncomment the following to test trained model on one sentence
 
-# input_text = "Das ist sehr falsch."
-# inputs = tokenizer(input_text, return_tensors="pt")
-# model = AutoModelForSequenceClassification.from_pretrained("/Users/melinaplakidis/Documents/Sprachtechnologie_HA/my_awesome_model/checkpoint-194/", local_files_only=True)
-# with torch.no_grad():
-#     logits = model(**inputs).logits
-# predicted_class_id = logits.argmax().item()
-# print(model.config.id2label[predicted_class_id])
+# # input_text = "Das ist sehr falsch."
+# # inputs = tokenizer(input_text, return_tensors="pt")
+# # model = AutoModelForSequenceClassification.from_pretrained("/Path/to/model_name/checkpoint-194/", local_files_only=True)
+# # with torch.no_grad():
+# #     logits = model(**inputs).logits
+# # predicted_class_id = logits.argmax().item()
+# # print(model.config.id2label[predicted_class_id])
